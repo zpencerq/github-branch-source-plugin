@@ -88,6 +88,7 @@ import jenkins.scm.api.metadata.ObjectMetadataAction;
 import jenkins.scm.api.metadata.PrimaryInstanceMetadataAction;
 import jenkins.scm.impl.ChangeRequestSCMHeadCategory;
 import jenkins.scm.impl.UncategorizedSCMHeadCategory;
+import jenkins.scm.impl.TagSCMHeadCategory;
 import org.apache.commons.lang.StringUtils;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.ObjectId;
@@ -104,6 +105,7 @@ import org.kohsuke.github.GHMyself;
 import org.kohsuke.github.GHOrganization;
 import org.kohsuke.github.GHPullRequest;
 import org.kohsuke.github.GHRepository;
+import org.kohsuke.github.GHTag;
 import org.kohsuke.github.GHUser;
 import org.kohsuke.github.GitHub;
 import org.kohsuke.github.HttpException;
@@ -551,6 +553,7 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 }
                 boolean trusted = collaboratorNames != null
                         && collaboratorNames.contains(ghPullRequest.getHead().getRepository().getOwnerName());
+
                 if (!trusted) {
                     listener.getLogger().format("    (not from a trusted source)%n");
                 }
@@ -720,6 +723,23 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 branches++;
             }
             listener.getLogger().format("%n  %d branches were processed%n", branches);
+
+            List<GHTag> tagList = repo.listTags().asList();
+
+            for (GHTag tag: tagList) {
+
+                SCMHead taghead = new TaggedSCMHead(tag.getName(), tag.getCommit().getCommitDate().getTime());
+
+                SCMRevision taghash = new SCMRevisionImpl(taghead, tag.getCommit().getSHA1());
+
+                listener.getLogger().format("    Tag: %s SHA: %s %n", tag.getName(), tag.getCommit().getSHA1());
+
+                observer.observe(taghead, taghash);
+                if (!observer.isObserving()) {
+                    listener.getLogger().format("    Error: Observer is not Observing.");
+                    return;
+                }
+            }
         }
     }
 
@@ -804,7 +824,11 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
             }
             return new PullRequestSCMRevision((PullRequestSCMHead) head, baseHash, pr.getHead().getSha());
         } else {
-            return new SCMRevisionImpl(head, repo.getRef("heads/" + head.getName()).getObject().getSha());
+            try {
+                return new SCMRevisionImpl(head, repo.getRef("heads/" + head.getName()).getObject().getSha());
+            } catch (FileNotFoundException e) {
+                return new SCMRevisionImpl(head, repo.getRef("tags/" + head.getName()).getObject().getSha());
+            }
         }
     }
 
@@ -1327,8 +1351,9 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
         protected SCMHeadCategory[] createCategories() {
             return new SCMHeadCategory[]{
                     new UncategorizedSCMHeadCategory(Messages._GitHubSCMSource_UncategorizedCategory()),
-                    new ChangeRequestSCMHeadCategory(Messages._GitHubSCMSource_ChangeRequestCategory())
-                    // TODO add support for tags and maybe feature branch identification
+                    new ChangeRequestSCMHeadCategory(Messages._GitHubSCMSource_ChangeRequestCategory()),
+                    new TagSCMHeadCategory(Messages._GitHubSCMSource_Tags())
+                    // TODO add support for feature branch identification
             };
         }
 
