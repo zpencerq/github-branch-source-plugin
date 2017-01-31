@@ -569,8 +569,16 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                     }
                     continue;
                 }
-                boolean trusted = collaboratorNames != null
-                        && collaboratorNames.contains(ghPullRequest.getHead().getRepository().getOwnerName());
+
+                boolean trusted;
+
+                try {
+                    trusted = collaboratorNames != null && collaboratorNames.contains(ghPullRequest.getHead().getRepository().getOwnerName());
+                }
+                catch(NullPointerException e ){
+                    // If someone is removed from a private repository but has an open PR
+                    continue;
+                }
 
                 if (!trusted) {
                     listener.getLogger().format("    (not from a trusted source)%n");
@@ -848,12 +856,11 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 baseHash = pr.getBase().getSha();
             }
             return new PullRequestSCMRevision((PullRequestSCMHead) head, baseHash, pr.getHead().getSha());
-        } else {
-            try {
-                return new SCMRevisionImpl(head, repo.getRef("heads/" + head.getName()).getObject().getSha());
-            } catch (FileNotFoundException e) {
-                return new SCMRevisionImpl(head, repo.getRef("tags/" + head.getName()).getObject().getSha());
-            }
+        } else if (head instanceof TaggedSCMHead) {
+            return new SCMRevisionImpl(head, repo.getRef("tags/" + head.getName()).getObject().getSha());
+        }
+        else {
+            return new SCMRevisionImpl(head, repo.getRef("heads/" + head.getName()).getObject().getSha());
         }
     }
 
