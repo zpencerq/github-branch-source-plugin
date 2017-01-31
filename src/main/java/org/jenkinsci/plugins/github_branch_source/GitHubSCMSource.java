@@ -70,9 +70,12 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.net.ssl.SSLHandshakeException;
+import jenkins.management.ConfigureLink;
 import jenkins.plugins.git.AbstractGitSCMSource;
 import jenkins.scm.api.SCMHead;
 import jenkins.scm.api.SCMHeadCategory;
@@ -84,6 +87,7 @@ import jenkins.scm.api.SCMSourceCriteria;
 import jenkins.scm.api.SCMSourceDescriptor;
 import jenkins.scm.api.SCMSourceEvent;
 import jenkins.scm.api.SCMSourceOwner;
+import jenkins.scm.api.metadata.ContributorMetadataAction;
 import jenkins.scm.api.metadata.ObjectMetadataAction;
 import jenkins.scm.api.metadata.PrimaryInstanceMetadataAction;
 import jenkins.scm.impl.ChangeRequestSCMHeadCategory;
@@ -123,6 +127,11 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
     public static final String VALID_GIT_SHA1 = "^[a-fA-F0-9]{40}$";
     public static final String GITHUB_URL = GitHubServerConfig.GITHUB_URL;
     private static final Logger LOGGER = Logger.getLogger(GitHubSCMSource.class.getName());
+    /**
+     * Log spam protection, only log at most once every 5 minutes.
+     */
+    // TODO remove once baseline Git plugin 3.0.2+
+    private static final AtomicLong jenkins41244Warning = new AtomicLong();
 
     private final String apiUri;
 
@@ -176,6 +185,11 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
      */
     @NonNull
     private transient /*effectively final*/ Map<Integer,ObjectMetadataAction> pullRequestMetadataCache;
+    /**
+     * The cache of {@link ObjectMetadataAction} instances for each open PR.
+     */
+    @NonNull
+    private transient /*effectively final*/ Map<Integer,ContributorMetadataAction> pullRequestContributorCache;
 
     @DataBoundConstructor
     public GitHubSCMSource(String id, String apiUri, String checkoutCredentialsId, String scanCredentialsId, String repoOwner, String repository) {
@@ -186,6 +200,7 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
         this.scanCredentialsId = Util.fixEmpty(scanCredentialsId);
         this.checkoutCredentialsId = checkoutCredentialsId;
         pullRequestMetadataCache = new ConcurrentHashMap<>();
+        pullRequestContributorCache = new ConcurrentHashMap<>();
     }
 
     /** Use defaults for old settings. */
@@ -211,6 +226,9 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
         }
         if (pullRequestMetadataCache == null) {
             pullRequestMetadataCache = new ConcurrentHashMap<>();
+        }
+        if (pullRequestContributorCache == null) {
+            pullRequestContributorCache = new ConcurrentHashMap<>();
         }
         return this;
     }
@@ -599,6 +617,12 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                                     ghPullRequest.getHtmlUrl().toExternalForm()
                             )
                     );
+                    GHUser user = ghPullRequest.getUser();
+                    pullRequestContributorCache.put(number, new ContributorMetadataAction(
+                            user.getLogin(),
+                            user.getName(),
+                            user.getEmail()
+                            ));
                     pullRequestMetadataKeys.add(number);
                     PullRequestSCMHead head = new PullRequestSCMHead(ghPullRequest, branchName, merge);
                     if (includes != null && !includes.contains(head)) {
@@ -645,6 +669,7 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
             if (includes == null) {
                 // we did a full scan, so trim the cache entries
                 this.pullRequestMetadataCache.keySet().retainAll(pullRequestMetadataKeys);
+                this.pullRequestContributorCache.keySet().retainAll(pullRequestMetadataKeys);
             }
         }
 
@@ -839,10 +864,10 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
             GitSCM scm = (GitSCM) super.build(head, null);
             String repoUrl = repositoryUrl(getRepoOwner(), getRepository());
             if (repoUrl != null) {
-                scm.setBrowser(new GithubWeb(repoUrl));
+                setBrowser(scm, repoUrl);
             }
             return scm;
-        } else if (head instanceof PullRequestSCMHead) {
+        } else if (head instanceof PullRequestSCMHead && ((PullRequestSCMHead) head).getSourceRepo() != null) {
             if (revision instanceof PullRequestSCMRevision) {
                 PullRequestSCMRevision prRev = (PullRequestSCMRevision) revision;
                 // we rely on GitHub exposing the pull request revision on the target repository
@@ -860,7 +885,7 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 String repoUrl = repositoryUrl(((PullRequestSCMHead) head).getSourceOwner(),
                         ((PullRequestSCMHead) head).getSourceRepo());
                 if (repoUrl != null) {
-                    scm.setBrowser(new GithubWeb(repoUrl));
+                    setBrowser(scm, repoUrl);
                 }
                 return scm;
             } else {
@@ -870,7 +895,7 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 GitSCM scm = (GitSCM) super.build(head, revision);
                 String repoUrl = repositoryUrl(getRepoOwner(), getRepository());
                 if (repoUrl != null) {
-                    scm.setBrowser(new GithubWeb(repoUrl));
+                    setBrowser(scm, repoUrl);
                 }
                 return scm;
             }
@@ -878,9 +903,32 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
             GitSCM scm = (GitSCM) super.build(head, /* casting just as an assertion */(SCMRevisionImpl) revision);
             String repoUrl = repositoryUrl(getRepoOwner(), getRepository());
             if (repoUrl != null) {
-                scm.setBrowser(new GithubWeb(repoUrl));
+                setBrowser(scm, repoUrl);
             }
             return scm;
+        }
+    }
+
+    // TODO remove and replace with scm.setBrowser(repoUrl) directly once baseline Git plugin 3.0.2+
+    private void setBrowser(GitSCM scm, String repoUrl) {
+        try {
+            scm.setBrowser(new GithubWeb(repoUrl));
+        } catch (NoSuchMethodError e) {
+            Level level;
+            long now = System.currentTimeMillis();
+            long next = jenkins41244Warning.get();
+            if (now >= next) {
+                long newNext = now + TimeUnit.MINUTES.toMillis(5);
+                if (jenkins41244Warning.compareAndSet(next, newNext)) {
+                    level = Level.WARNING;
+                } else {
+                    level = Level.FINE;
+                }
+            } else  {
+                level = Level.FINE;
+            }
+            LOGGER.log(level, "JENKINS-41244: GitHub Branch Source cannot set browser url with currently "
+                    + "installed version of Git plugin", e);
         }
     }
 
@@ -960,6 +1008,11 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
     public SCMRevision getTrustedRevision(SCMRevision revision, TaskListener listener)
             throws IOException, InterruptedException {
         if (revision instanceof PullRequestSCMRevision) {
+            PullRequestSCMHead head = (PullRequestSCMHead) revision.getHead();
+            if (repoOwner.equals(head.getSourceOwner())) {
+                // origin PR
+                return revision;
+            }
             /*
              * Evaluates whether this pull request is coming from a trusted source.
              * Quickest is to check whether the author of the PR
@@ -1026,7 +1079,6 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                     }
                 }
             }
-            PullRequestSCMHead head = (PullRequestSCMHead) revision.getHead();
             if (!collaboratorNames.contains(head.getSourceOwner())) {
                 PullRequestSCMRevision rev = (PullRequestSCMRevision) revision;
                 listener.getLogger().format("Loading trusted files from base branch %s at %s rather than %s%n",
@@ -1072,11 +1124,16 @@ public class GitHubSCMSource extends AbstractGitSCMSource {
                 ObjectMetadataAction metadataAction = null;
                 if (head instanceof PullRequestSCMHead) {
                     // pull request to this repository
-                    url = repoLink.getUrl() + "/pull/" + ((PullRequestSCMHead) head).getNumber();
-                    metadataAction = pullRequestMetadataCache.get(((PullRequestSCMHead) head).getNumber());
+                    int number = ((PullRequestSCMHead) head).getNumber();
+                    url = repoLink.getUrl() + "/pull/" + number;
+                    metadataAction = pullRequestMetadataCache.get(number);
                     if (metadataAction == null) {
                         // best effort
                         metadataAction = new ObjectMetadataAction(null, null, url);
+                    }
+                    ContributorMetadataAction contributor = pullRequestContributorCache.get(number);
+                    if (contributor != null) {
+                        result.add(contributor);
                     }
                 } else {
                     // branch in this repository
